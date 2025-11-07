@@ -93,6 +93,12 @@ def build_three_leg_profile(start_alt_ft: float, end_alt_ft: float, distance_nm:
     ]
     return MissionProfile(start_alt_ft, end_alt_ft, distance_nm, isa_dev_c, initial_fuel_lb, legs)
 
+def fmt_time_sec_to_minsec(sec: float) -> str:
+    m = int(sec // 60)
+    s = int(sec % 60)
+    return f"{m:02d}:{s:02d}"
+
+
 class App(tk.Tk):
     def __init__(self) -> None:
         super().__init__()
@@ -219,12 +225,29 @@ class App(tk.Tk):
         self.summary.insert(tk.END, f"Time s: {time_s:.1f}\n")
         self.summary.insert(tk.END, f"Arrival fuel lb: {arr:.1f}\n")
         for idx, leg in enumerate(prof.legs, 1):
-            if leg.phase == "climb":
-                self.summary.insert(tk.END, f"Leg {idx}: climb to {int(leg.target_alt_ft or 0)} ft over {leg.dx_nm:.1f} nm at {leg.tas_kt:.0f} kt\n")
-            elif leg.phase == "cruise":
-                self.summary.insert(tk.END, f"Leg {idx}: cruise at {int(leg.target_alt_ft or 0)} ft for {leg.dx_nm:.1f} nm at {leg.tas_kt:.0f} kt\n")
-            else:
-                self.summary.insert(tk.END, f"Leg {idx}: descend to {int(leg.target_alt_ft or 0)} ft over {leg.dx_nm:.1f} nm at {leg.tas_kt:.0f} kt\n")
+            time_leg_s = (leg.dx_nm / leg.tas_kt) * 3600.0
+        time_str = fmt_time_sec_to_minsec(time_leg_s)
+        angle_deg = math.degrees(math.atan2(leg.dh_ft, leg.dx_nm * 6076.12))
+
+        if leg.phase == "climb":
+            text = (
+                f"Leg {idx}: climb to {int(leg.target_alt_ft)} ft over {leg.dx_nm:.1f} nm at {leg.tas_kt:.0f} kt\n"
+                f"    Angle: {angle_deg:.2f}°, Time: {time_str}\n"
+            )
+        elif leg.phase == "cruise":
+            text = (
+                f"Leg {idx}: cruise at {int(leg.target_alt_ft)} ft for {leg.dx_nm:.1f} nm at {leg.tas_kt:.0f} kt\n"
+                f"    Time: {time_str}\n"
+            )
+        else:
+            text = (
+                f"Leg {idx}: descend to {int(leg.target_alt_ft)} ft over {leg.dx_nm:.1f} nm at {leg.tas_kt:.0f} kt\n"
+                f"    Angle: {angle_deg:.2f}°, Time: {time_str}\n"
+            )
+
+        self.summary.insert(tk.END, text)
+
+
 
 if __name__ == "__main__":
     App().mainloop()
