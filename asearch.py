@@ -23,7 +23,7 @@ Inputs (GUI):
 Outputs:
  - Top-down X-Y path plot
  - Altitude vs along-track distance plot (z in ft)
- - Text summary with total time (mm:ss), fuel
+ - Text summary with totals and per-step legs
 """
 
 import math
@@ -32,6 +32,8 @@ import json
 import tkinter as tk
 from tkinter import ttk, messagebox
 from typing import Tuple, List, Dict, Optional
+
+# Matplotlib embed
 import matplotlib
 matplotlib.use("TkAgg")
 from matplotlib.figure import Figure
@@ -51,31 +53,34 @@ NZ = int(Z_MAX_FT / DZ_FT) + 1   # 121
 # Safety: check sizes
 assert NX * NY * NZ <= 2_000_000, "Grid is very large; modify parameters."
 
-# ------- Simple performance model (tunable) -------
-# Horizontal TAS depending on phase:
-TAS_CRUISE_KT = 420.0
-TAS_CLIMB_KT = 250.0
+# ------- Base performance constants (phase nominals) -------
+TAS_CRUISE_KT  = 420.0
+TAS_CLIMB_KT   = 250.0
 TAS_DESCENT_KT = 260.0
 
-# Fuel burn rates (lb/hr) approximate:
-FUEL_CRUISE_LBPH = 2600.0
-FUEL_CLIMB_LBPH = 3500.0
+FUEL_CRUISE_LBPH  = 2600.0
+FUEL_CLIMB_LBPH   = 3500.0
 FUEL_DESCENT_LBPH = 900.0
 
-# For heuristic we use optimistic rates (best case)
-MAX_TAS_KT = max(TAS_CRUISE_KT, TAS_CLIMB_KT, TAS_DESCENT_KT)
-MIN_FUEL_RATE_LBPH = min(FUEL_CRUISE_LBPH, FUEL_CLIMB_LBPH, FUEL_DESCENT_LBPH)
+# Vertical rates for time realism
+CLIMB_RATE_FPM   = 2000.0
+DESCENT_RATE_FPM = 2500.0
 
 # Utility conversions
 NM_TO_FT = 6076.12
-KT_TO_NM_PER_HR = 1.0  # 1 kt = 1 nm/hr, used as scale
+
+# For heuristic we use optimistic rates
+# Cap TAS improvements to keep heuristic conservative
+CRUISE_TAS_CAP_FACTOR = 1.12  # up to +12 percent at high altitude
+MAX_TAS_KT = TAS_CRUISE_KT * CRUISE_TAS_CAP_FACTOR
+MIN_FUEL_RATE_LBPH = min(FUEL_CRUISE_LBPH, FUEL_CLIMB_LBPH, FUEL_DESCENT_LBPH)
 
 # ------- Helper functions -------
 def clamp(v, lo, hi):
     return max(lo, min(hi, v))
 
 def alt_to_level(alt_ft: float) -> int:
-    """Convert alt in ft to nearest grid level index"""
+    """Convert alt in ft to nearest grid level index."""
     lvl = int(round(alt_ft / DZ_FT))
     return clamp(lvl, 0, NZ - 1)
 
@@ -89,20 +94,70 @@ def fmt_time_sec_to_minsec(sec: float) -> str:
     s = int(round(sec % 60))
     return f"{m:02d}:{s:02d}"
 
-def node_to_key(x:int,y:int,z:int) -> Tuple[int,int,int]:
-    return (x,y,z)
+def fmt_time_hms(sec: float) -> str:
+    sec = max(0, int(round(sec)))
+    h = sec // 3600
+    m = (sec % 3600) // 60
+    s = sec % 60
+    return f"{h:02d}:{m:02d}:{s:02d}"
 
 def euclidean_3d_nm(x1,y1,z1,x2,y2,z2) -> float:
-    """Distance in NM: convert vertical ft -> nm via NM_TO_FT"""
+    """Distance in NM: convert vertical ft -> nm via NM_TO_FT."""
     dx = (x1 - x2)
     dy = (y1 - y2)
     dz_ft = (z1 - z2) * DZ_FT
     dz_nm = dz_ft / NM_TO_FT
     return math.sqrt(dx*dx + dy*dy + dz_nm*dz_nm)
 
+# ------- Altitude-aware performance shaping -------
+def tas_at_alt_phase(alt_ft: float, phase: str) -> float:
+    """
+    Simple TAS model that increases with altitude up to a capped factor.
+    """
+    if phase == "climb":
+        base = TAS_CLIMB_KT
+        gain_per_kft = 0.002   # +0.2 percent per 1 kft
+        cap = 1.08
+    elif phase == "descent":
+        base = TAS_DESCENT_KT
+        gain_per_kft = 0.002
+        cap = 1.08
+    else:
+        base = TAS_CRUISE_KT
+        gain_per_kft = 0.003   # +0.3 percent per 1 kft
+        cap = CRUISE_TAS_CAP_FACTOR
+    kft = max(alt_ft, 0.0) / 1000.0
+    factor = min(1.0 + gain_per_kft * kft, cap)
+    return base * factor
+
+def fuel_rate_at_alt_phase(alt_ft: float, phase: str) -> float:
+    """
+    Fuel rate improves with altitude, has a floor, and adds a low-alt penalty below 10 kft.
+    """
+    if phase == "climb":
+        base = FUEL_CLIMB_LBPH
+        reduce_per_kft = 0.006
+        floor = 0.70
+    elif phase == "descent":
+        base = FUEL_DESCENT_LBPH
+        reduce_per_kft = 0.004
+        floor = 0.75
+    else:
+        base = FUEL_CRUISE_LBPH
+        reduce_per_kft = 0.008
+        floor = 0.65
+    kft = max(alt_ft, 0.0) / 1000.0
+    factor = max(floor, 1.0 - reduce_per_kft * kft)
+
+    # penalty for low altitude to discourage "sea level cruise"
+    low_alt_pen = 0.0
+    if alt_ft < 10000.0:
+        low_alt_pen = (10000.0 - alt_ft) / 10000.0 * 0.20   # up to +20 percent at ground
+
+    return base * (factor + low_alt_pen)
+
 # ------- Obstacles -------
 # Obstacle structure: dict with xmin,xmax,ymin,ymax,zmin_ft,zmax_ft
-# Example default obstacles
 DEFAULT_OBSTACLES = [
     {"xmin":20,"xmax":40,"ymin":30,"ymax":40,"zmin_ft":0,"zmax_ft":15000},
     {"xmin":60,"xmax":80,"ymin":60,"ymax":80,"zmin_ft":20000,"zmax_ft":40000},
@@ -149,9 +204,19 @@ def obstacle_blocks_node(obs: Dict, x:int,y:int,z:int) -> bool:
             obs.get("ymin", -1e9) <= y <= obs.get("ymax", 1e9) and
             obs.get("zmin_ft", -1e9) <= z_ft <= obs.get("zmax_ft", 1e9))
 
-# ------- A* search -------
-from collections import defaultdict
+def edge_crosses_obstacle(a: Tuple[int,int,int], b: Tuple[int,int,int], obs: Dict) -> bool:
+    """
+    Conservative mid-sampling to prevent edges from sneaking through prisms.
+    """
+    ax, ay, az = a; bx, by, bz = b
+    mx = int(round(0.5 * (ax + bx)))
+    my = int(round(0.5 * (ay + by)))
+    mz = int(round(0.5 * (az + bz)))
+    return (obstacle_blocks_node(obs, ax, ay, az) or
+            obstacle_blocks_node(obs, mx, my, mz) or
+            obstacle_blocks_node(obs, bx, by, bz))
 
+# ------- A* search -------
 def neighbors_of(node: Tuple[int,int,int]) -> List[Tuple[int,int,int]]:
     x,y,z = node
     res = []
@@ -164,86 +229,87 @@ def neighbors_of(node: Tuple[int,int,int]) -> List[Tuple[int,int,int]]:
             for dz in (-1,0,1):
                 nz = z + dz
                 if nz < 0 or nz >= NZ: continue
-                if dx == 0 and dy == 0 and dz == 0: 
+                if dx == 0 and dy == 0 and dz == 0:
                     continue
                 res.append((nx,ny,nz))
     return res
 
 def cost_between(a: Tuple[int,int,int], b: Tuple[int,int,int]) -> Tuple[float,float]:
     """
-    Returns (fuel_lb, time_s) to travel between adjacent grid nodes a->b.
-    a and b are neighbors (max 1 step in each axis).
-    Model is simplistic but tunable:
-      - Horizontal distance (nm) based on dx,dy
-      - Vertical step based on dz * DZ_FT
-      - Phase: climb if dz>0, descent if dz<0 else cruise
-      - Time = horiz_nm / TAS_phase (hours) -> seconds
-      - Fuel = fuel_rate_phase * time_hours
+    Returns (fuel_lb, time_s) between adjacent nodes a->b.
+    Altitude-aware TAS and fuel rate, plus vertical time via climb/descent rates.
     """
     (ax,ay,az) = a
     (bx,by,bz) = b
     dx = (bx - ax)
     dy = (by - ay)
-    horiz_nm = math.hypot(dx, dy)  # in nm, since grid spacing is 1 nm
+    horiz_nm = math.hypot(dx, dy) * DX_NM
     dz_ft = (bz - az) * DZ_FT
 
-    # phase
+    # use altitude at the "to" node for evaluation
+    alt_ft = level_to_alt(bz)
+
+    # phase and vertical time
     if dz_ft > 1e-6:
-        tas = TAS_CLIMB_KT
-        fuel_rate = FUEL_CLIMB_LBPH
+        phase = "climb"
+        tas = tas_at_alt_phase(alt_ft, phase)
+        fuel_rate = fuel_rate_at_alt_phase(alt_ft, phase)
+        vert_time_hr = (dz_ft / max(CLIMB_RATE_FPM, 1e-3)) / 60.0
     elif dz_ft < -1e-6:
-        tas = TAS_DESCENT_KT
-        fuel_rate = FUEL_DESCENT_LBPH
+        phase = "descent"
+        tas = tas_at_alt_phase(alt_ft, phase)
+        fuel_rate = fuel_rate_at_alt_phase(alt_ft, phase)
+        vert_time_hr = (abs(dz_ft) / max(DESCENT_RATE_FPM, 1e-3)) / 60.0
     else:
-        tas = TAS_CRUISE_KT
-        fuel_rate = FUEL_CRUISE_LBPH
+        phase = "cruise"
+        tas = tas_at_alt_phase(alt_ft, phase)
+        fuel_rate = fuel_rate_at_alt_phase(alt_ft, phase)
+        vert_time_hr = 0.0
 
-    # Horizontal time (hr) -- if horiz_nm == 0 but vertical change exists, we still model a small horizontal progress
-    if horiz_nm <= 0:
-        # vertical-only move: model as small horizontal equivalent of 0.001 nm to avoid zero division
-        horiz_nm = 0.001
-
-    time_hr = horiz_nm / tas
+    horiz_time_hr = (horiz_nm / tas) if horiz_nm > 0 else 0.0
+    time_hr = max(horiz_time_hr, vert_time_hr)  # crude coupling so climbs take time
     time_s = time_hr * 3600.0
 
-    # base fuel from horizontal travel
+    # base fuel proportional to time in this phase
     fuel = fuel_rate * time_hr
 
-    # additional fuel penalty for vertical change (very small)
-    # climb energy cost approximated proportional to vertical ft
-    # This coefficient is arbitrary/tunable (lb per ft)
-    vertical_work_factor = 0.01  # ~0.01 lb per ft of climb (tunable)
+    # small vertical energy term
+    vertical_work_factor = 0.01
     if dz_ft > 0:
         fuel += dz_ft * vertical_work_factor
     elif dz_ft < 0:
-        # descending actually uses a little fuel but less (we'll subtract a small fraction)
         fuel += abs(dz_ft) * (vertical_work_factor * 0.25)
+
+    # ensure nonzero time
+    if time_s == 0.0:
+        time_s = (0.001 / MAX_TAS_KT) * 3600.0
+        fuel += MIN_FUEL_RATE_LBPH * (time_s / 3600.0)
 
     return fuel, time_s
 
 def heuristic(a: Tuple[int,int,int], goal: Tuple[int,int,int], objective: str) -> float:
     """
     Admissible heuristic:
-      - For time: straight-line 3D distance / MAX_TAS_KT converted to seconds (optimistic).
-      - For fuel: straight-line horizontal distance / 1 hr * MIN_FUEL_RATE (optimistic), plus tiny vertical fuel.
+      - For time: horizontal straight-line distance / max TAS, to seconds.
+      - For fuel: time with min fuel rate, plus a tiny vertical fuel component that is ≤ real climb cost.
     """
-    ax,ay,az = a
-    gx,gy,gz = goal
-    dist_nm = euclidean_3d_nm(ax,ay,az,gx,gy,gz)
+    ax, ay, az = a
+    gx, gy, gz = goal
+    # horizontal distance only to keep it optimistic under our time model
+    dx = gx - ax
+    dy = gy - ay
+    horiz_nm = math.hypot(dx, dy) * DX_NM
     if objective == "time":
-        # time in seconds (optimistic)
-        time_hr = dist_nm / MAX_TAS_KT
+        time_hr = horiz_nm / MAX_TAS_KT
         return time_hr * 3600.0
     else:
-        # fuel in lb (optimistic)
-        time_hr = dist_nm / MAX_TAS_KT
+        time_hr = horiz_nm / MAX_TAS_KT
         fuel = MIN_FUEL_RATE_LBPH * time_hr
-        # small vertical fuel estimate
         dz_ft = abs((gz - az) * DZ_FT)
-        fuel += dz_ft * 0.005
+        fuel += dz_ft * 0.0025   # guaranteed ≤ actual climb penalty (0.01) and descent credit
         return fuel
 
-def a_star(start: Tuple[int,int,int], goal: Tuple[int,int,int], obstacles: List[Dict], objective: str, max_expansions: int=5_000_000):
+def a_star(start: Tuple[int,int,int], goal: Tuple[int,int,int], obstacles: List[Dict], objective: str, max_expansions: int=1_000_000):
     """
     A* search. returns (path list of nodes from start to goal, total_fuel, total_time_s)
     or (None, None, None) if no path found.
@@ -256,10 +322,10 @@ def a_star(start: Tuple[int,int,int], goal: Tuple[int,int,int], obstacles: List[
         if obstacle_blocks_node(obs, *goal):
             raise ValueError("Goal location blocked by obstacle")
 
-    open_heap = []
-    # g-scores: cost from start to node. We keep two g scores depending objective: if objective == 'time' g is time_s, else fuel_lb
-    gscore = {}
-    came_from = {}
+    open_heap: List[Tuple[float, float, Tuple[int,int,int]]] = []
+    gscore: Dict[Tuple[int,int,int], float] = {}
+    came_from: Dict[Tuple[int,int,int], Tuple[int,int,int]] = {}
+    closed: set = set()
 
     start_cost = 0.0
     gscore[start] = start_cost
@@ -270,8 +336,12 @@ def a_star(start: Tuple[int,int,int], goal: Tuple[int,int,int], obstacles: List[
 
     while open_heap:
         _, current_g, current = heapq.heappop(open_heap)
+        if current in closed:
+            continue
+        closed.add(current)
+
         expansions += 1
-        if expansions % 100000 == 0:
+        if expansions % 200000 == 0:
             print(f"expanded {expansions} nodes...")
 
         if current == goal:
@@ -294,10 +364,10 @@ def a_star(start: Tuple[int,int,int], goal: Tuple[int,int,int], obstacles: List[
 
         # expand neighbors
         for nb in neighbors_of(current):
-            # check obstacle
+            # check obstacle at node and along edge
             blocked = False
             for obs in obstacles:
-                if obstacle_blocks_node(obs, *nb):
+                if obstacle_blocks_node(obs, *nb) or edge_crosses_obstacle(current, nb, obs):
                     blocked = True
                     break
             if blocked:
@@ -351,7 +421,7 @@ class App(tk.Tk):
         ttk.Label(left, text="Obstacles (JSON list or one JSON dict per line)").pack(anchor="w", pady=(8,0))
         self.obs_text = tk.Text(left, height=8, width=36)
         self.obs_text.pack(fill=tk.X)
-        # fill with defaults
+        # defaults
         self.obs_text.insert("1.0", json.dumps(DEFAULT_OBSTACLES, indent=2))
 
         ttk.Button(left, text="Run A*", command=self.run_astar).pack(fill=tk.X, pady=8)
@@ -399,7 +469,7 @@ class App(tk.Tk):
             messagebox.showerror("Input error", f"Invalid inputs: {e}")
             return
 
-        # Convert continuous XY to grid indices (nearest integer)
+        # Convert continuous XY to grid indices
         sx_i = int(round(sx / DX_NM))
         sy_i = int(round(sy / DX_NM))
         gx_i = int(round(gx / DX_NM))
@@ -462,7 +532,6 @@ class App(tk.Tk):
             horiz = math.hypot(b[0]-a[0], b[1]-a[1]) * DX_NM
             dz_ft = (b[2]-a[2]) * DZ_FT
             dist = math.hypot(horiz, dz_ft / NM_TO_FT)
-            # cost_between returns fuel and time for this adjacent step
             f,t = cost_between(a,b)
             leg_dists.append(dist)
             leg_times_s.append(t)
@@ -494,13 +563,17 @@ class App(tk.Tk):
         self.ax_z.set_xlabel("Distance (nm)")
         self.ax_z.set_ylabel("Altitude (ft)")
         self.ax_z.plot(along, zs, marker="o")
+        # nice vertical padding
+        ymin = min(zs); ymax = max(zs)
+        pad = max(300.0, 0.05 * max(500.0, ymax - ymin))
+        self.ax_z.set_ylim(ymin - pad, ymax + pad)
         self.canvas_z.draw_idle()
 
         # Summary text
         self.summary.delete("1.0", tk.END)
         self.summary.insert(tk.END, f"Path nodes: {len(path)}\n")
-        self.summary.insert(tk.END, f"Total horizontal/3D distance (nm, approx): {total_dist:.2f}\n")
-        self.summary.insert(tk.END, f"Total time: {fmt_time_sec_to_minsec(total_time)} (hh:mm:ss approx {total_time/3600:.3f} hr)\n")
+        self.summary.insert(tk.END, f"Total distance (3D approx, nm): {total_dist:.2f}\n")
+        self.summary.insert(tk.END, f"Total time: {fmt_time_sec_to_minsec(total_time)} ({fmt_time_hms(total_time)})\n")
         self.summary.insert(tk.END, f"Total fuel (lb, approx): {total_fuel:.1f}\n\n")
 
         self.summary.insert(tk.END, "Legs (adjacent steps):\n")
