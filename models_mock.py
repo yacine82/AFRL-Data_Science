@@ -45,7 +45,7 @@ class MockFuelModel:
 
 # Swappable mock catalog. Later, replace values or keys with SPO models.
 MOCK_MODELS: Dict[str, FuelModel] = {
-    "mock_v1": MockFuelModel(),
-    "mock_econ": MockFuelModel(cruise_lb_per_nm_at_sl=2.4, cruise_alt_factor_per_kft=-0.035, max_tas_kt=440.0),
-    "mock_fast": MockFuelModel(climb_lb_per_kft=260.0, cruise_lb_per_nm_at_sl=3.2, max_tas_kt=500.0),
+    "KC-135": MockFuelModel(),
+    "KC-46": MockFuelModel(cruise_lb_per_nm_at_sl=2.4, cruise_alt_factor_per_kft=-0.035, max_tas_kt=440.0),
+    "KC-10": MockFuelModel(climb_lb_per_kft=260.0, cruise_lb_per_nm_at_sl=3.2, max_tas_kt=500.0),
 }
